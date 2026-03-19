@@ -108,7 +108,7 @@ export function SessionProvider({ children }) {
             );
         } catch (err) {
             console.error('AI pipeline error:', err);
-            addMessage('assistant', "I'm having trouble connecting right now. Please try again.", { isError: true });
+            addMessage('assistant', `Service error: ${err.message || 'Could not connect. Please check your API keys and try again.'}`, { isError: true });
             updateStatus('idle');
             setIsSpeakingAI(false);
         }

@@ -1,14 +1,8 @@
-// Murf AI Text-to-Speech Service
-// Uses the Murf Streaming API (Falcon model) for low-latency audio playback
-
+// Murf AI Text-to-Speech Service — GEN2, no fallback
 const MURF_API_KEY = import.meta.env.VITE_MURF_API_KEY;
-
-// Global endpoint — auto-routes to nearest region
 const MURF_GEN_URL = 'https://api.murf.ai/v1/speech/generate';
-const MURF_STREAM_URL = 'https://api.murf.ai/v1/speech/stream';
 
-
-// Per-language voice configuration — GEN2 with fastest voices per locale
+// Per-language voice configuration — GEN2 with native voices
 const VOICE_MAP = {
     'en': {
         voice_id: 'en-US-natalie',
@@ -17,28 +11,26 @@ const VOICE_MAP = {
         multiNativeLocale: 'en-IN',
     },
     'hi': {
-        voice_id: 'hi-IN-shweta',     // Native Hindi female — clear & natural
+        voice_id: 'hi-IN-shweta',
         modelVersion: 'GEN2',
         style: 'Conversational',
     },
     'hinglish': {
-        voice_id: 'hi-IN-shweta',     // Native Hindi voice handles Hinglish well
+        voice_id: 'hi-IN-shweta',
         modelVersion: 'GEN2',
         style: 'Conversational',
     },
 };
-
 
 let currentAudio = null;
 let isSpeaking = false;
 let onEndCallback = null;
 
 /**
- * Speak text using Murf AI
- * Returns a promise that resolves when audio finishes or rejects on error.
+ * Speak text using Murf AI GEN2 — no fallback.
+ * If Murf fails, onError is called and audio is silent.
  */
 export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onError } = {}) {
-    // Stop any currently playing audio first
     stopMurfSpeaking();
 
     // Clean text (strip ASSESSMENT blocks, markdown)
@@ -48,35 +40,42 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
         .replace(/\n+/g, ' ')
         .trim();
 
-    if (!cleanText) {
+    if (!cleanText) { onEnd?.(); return; }
+
+    if (!MURF_API_KEY) {
+        console.error('Murf API key missing');
+        onError?.('Murf API key not configured');
         onEnd?.();
         return;
     }
 
     const voiceCfg = VOICE_MAP[language] || VOICE_MAP['en'];
 
-    try {
-        isSpeaking = true;
-        onEndCallback = onEnd;
+    isSpeaking = true;
+    onEndCallback = onEnd;
 
-        // Use Murf generate endpoint (returns audio_file URL)
-        // This is simpler and more reliable in the browser than streaming PCM
+    try {
+        const payload = {
+            text: cleanText,
+            voiceId: voiceCfg.voice_id,
+            style: voiceCfg.style,
+            modelVersion: voiceCfg.modelVersion || 'GEN2',
+            format: 'MP3',
+            sampleRate: 24000,
+            channelType: 'MONO',
+        };
+        // Only include multiNativeLocale if defined
+        if (voiceCfg.multiNativeLocale) {
+            payload.multiNativeLocale = voiceCfg.multiNativeLocale;
+        }
+
         const response = await fetch(MURF_GEN_URL, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'api-key': MURF_API_KEY,
             },
-            body: JSON.stringify({
-                text: cleanText,
-                voiceId: voiceCfg.voice_id,
-                style: voiceCfg.style,
-                modelVersion: voiceCfg.modelVersion || 'GEN2',
-                multiNativeLocale: voiceCfg.multiNativeLocale || 'en-IN',
-                format: 'MP3',
-                sampleRate: 24000,
-                channelType: 'MONO',
-            }),
+            body: JSON.stringify(payload),
         });
 
         if (!response.ok) {
@@ -86,8 +85,7 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
 
         const data = await response.json();
 
-        // Prefer encodedAudio (base64) for zero-latency playback.
-        // Avoids a 2nd round-trip to fetch the audioFile URL.
+        // Prefer encodedAudio (base64) for instant playback — avoids a 2nd fetch
         let audioSrc;
         if (data?.encodedAudio) {
             audioSrc = `data:audio/mp3;base64,${data.encodedAudio}`;
@@ -95,27 +93,19 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
             audioSrc = data?.audioFile || data?.audio_file || data?.url;
         }
 
-        if (!audioSrc) {
-            throw new Error('Murf returned no audio');
-        }
+        if (!audioSrc) throw new Error('Murf returned no audio');
 
-        // Play directly — base64 data URIs start instantly
         currentAudio = new Audio(audioSrc);
         currentAudio.volume = 1.0;
-
-        currentAudio.onplay = () => {
-            onStart?.();
-        };
-
+        currentAudio.onplay = () => onStart?.();
         currentAudio.onended = () => {
             isSpeaking = false;
             currentAudio = null;
             onEnd?.();
             onEndCallback = null;
         };
-
-        currentAudio.onerror = (e) => {
-            console.error('Murf audio playback error:', e);
+        currentAudio.onerror = () => {
+            console.error('Murf audio playback error');
             isSpeaking = false;
             currentAudio = null;
             onError?.('Audio playback failed');
@@ -128,8 +118,8 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
         console.error('Murf TTS error:', err);
         isSpeaking = false;
         currentAudio = null;
-        // Gracefully fall back to Web Speech API
-        fallbackSpeak(cleanText, { language, onStart, onEnd, onError });
+        onError?.(err.message);
+        onEnd?.();
     }
 }
 
@@ -140,10 +130,6 @@ export function stopMurfSpeaking() {
         currentAudio = null;
     }
     isSpeaking = false;
-    // Also stop Web Speech fallback if running
-    if (window.speechSynthesis?.speaking) {
-        window.speechSynthesis.cancel();
-    }
     if (onEndCallback) {
         onEndCallback();
         onEndCallback = null;
@@ -152,36 +138,4 @@ export function stopMurfSpeaking() {
 
 export function isMurfSpeaking() {
     return isSpeaking || (currentAudio && !currentAudio.paused);
-}
-
-// ── Fallback: Web Speech API ─────────────────────────────────────────────────
-function fallbackSpeak(text, { language = 'en', onStart, onEnd, onError } = {}) {
-    const synth = window.speechSynthesis;
-    if (!synth) { onEnd?.(); return; }
-
-    synth.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
-    utt.rate = 0.92;
-    utt.onstart = onStart;
-    utt.onend = () => { isSpeaking = false; onEnd?.(); };
-    utt.onerror = (e) => { isSpeaking = false; onEnd?.(); };
-    isSpeaking = true;
-    synth.speak(utt);
-}
-
-/**
- * Get available Murf voices for a given locale
- */
-export async function getMurfVoices(locale = 'en-IN') {
-    try {
-        const res = await fetch(`https://in.api.murf.ai/v1/speech/voices?locale=${locale}`, {
-            headers: { 'api-key': MURF_API_KEY },
-        });
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data?.voices || data || [];
-    } catch {
-        return [];
-    }
 }

@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { detectLanguage, detectEmergency, detectStressKeywords } from '../services/languageDetection';
-import { sendToGemini, parseAssessment } from '../services/aiService';
-import { speakWithMurf, stopMurfSpeaking, isMurfSpeaking } from '../services/murfService';
-import { startDeepgramListening, stopDeepgramListening, mapDeepgramLang } from '../services/deepgramService';
+import { sendToGroq, parseAssessment } from '../services/aiService';
+import { speakWithMurf, stopMurfSpeaking } from '../services/murfService';
+import { startListeningService, stopListeningService, mapDeepgramLang, releaseMicrophone } from '../services/deepgramService';
 
 const SessionContext = createContext(null);
 
@@ -13,19 +13,24 @@ export function SessionProvider({ children }) {
     const [language, setLanguage] = useState('en');
     const [isEmergency, setIsEmergency] = useState(false);
     const [assessment, setAssessment] = useState(null);
-    const [screen, setScreen] = useState('home'); // home | chat | result
+    const [screen, setScreen] = useState('home');
     const [isSpeakingAI, setIsSpeakingAI] = useState(false);
     const [symptoms, setSymptoms] = useState([]);
+    const [micMethod, setMicMethod] = useState(null); // 'deepgram' | 'webspeech'
 
     const conversationHistoryRef = useRef([]);
+    // Use ref for status inside callbacks to avoid stale closures
+    const statusRef = useRef('idle');
+
+    const updateStatus = useCallback((s) => {
+        statusRef.current = s;
+        setStatus(s);
+    }, []);
 
     const addMessage = useCallback((role, content, meta = {}) => {
         const msg = { id: Date.now() + Math.random(), role, content, meta, timestamp: new Date() };
         setMessages(prev => [...prev, msg]);
-        conversationHistoryRef.current = [
-            ...conversationHistoryRef.current,
-            { role, content },
-        ];
+        conversationHistoryRef.current = [...conversationHistoryRef.current, { role, content }];
         return msg;
     }, []);
 
@@ -33,43 +38,35 @@ export function SessionProvider({ children }) {
     const processUserInput = useCallback(async (text, deepgramLang) => {
         if (!text?.trim()) return;
 
-        // Language: prefer Deepgram's detection, fall back to our heuristic
         const detectedLang = deepgramLang
             ? mapDeepgramLang(deepgramLang)
             : detectLanguage(text);
-
         setLanguage(detectedLang);
 
-        // Emergency detection
+        // Emergency check
         if (detectEmergency(text)) {
             setIsEmergency(true);
-            setStatus('emergency');
+            updateStatus('emergency');
             addMessage('user', text);
             const emergencyMsg = detectedLang === 'hi'
                 ? '🚨 यह आपातकाल हो सकता है। कृपया तुरंत 108 (एम्बुलेंस) या 112 (आपातकाल) पर कॉल करें!'
-                : '🚨 This sounds like a medical emergency. Please call 108 (Ambulance) or 112 (Emergency) IMMEDIATELY. Do not wait!';
+                : '🚨 This sounds like a medical emergency. Please call 108 (Ambulance) or 112 IMMEDIATELY!';
             addMessage('assistant', emergencyMsg, { isEmergency: true });
-
-            // Speak emergency message via Murf
             speakWithMurf(emergencyMsg, { language: detectedLang });
             return;
         }
 
-        // Move to chat screen
         if (screen === 'home') setScreen('chat');
 
         const isStressed = detectStressKeywords(text);
-
-        // Collect symptom tokens
         const symptomWords = text.split(/\s+/).filter(w => w.length > 4).slice(0, 3);
         setSymptoms(prev => [...new Set([...prev, ...symptomWords])].slice(0, 8));
 
         addMessage('user', text, { isStressed });
-        setStatus('processing');
+        updateStatus('processing');
 
         try {
-            // ── Step: Gemini AI ───────────────────────────────────────────────────
-            const aiResponse = await sendToGemini(
+            const aiResponse = await sendToGroq(
                 conversationHistoryRef.current.slice(0, -1),
                 text
             );
@@ -89,89 +86,88 @@ export function SessionProvider({ children }) {
                 displayText: displayText || aiResponse,
             });
 
-            // ── Step: Murf AI TTS ─────────────────────────────────────────────────
-            const speechText = hasFinalAssessment
-                ? `Here is my assessment. ${displayText || 'Please check the result panel for details.'}`
-                : aiResponse;
-
-            setStatus('speaking');
+            updateStatus('speaking');
             setIsSpeakingAI(true);
 
-            await speakWithMurf(speechText, {
-                language: detectedLang,
-                onStart: () => { },
-                onEnd: () => {
-                    setIsSpeakingAI(false);
-                    setStatus('idle');
-                    if (hasFinalAssessment) {
-                        setTimeout(() => setScreen('result'), 800);
-                    }
-                },
-                onError: () => {
-                    setIsSpeakingAI(false);
-                    setStatus('idle');
-                    if (hasFinalAssessment) {
-                        setTimeout(() => setScreen('result'), 800);
-                    }
-                },
-            });
+            speakWithMurf(hasFinalAssessment
+                ? `Here is my assessment. ${displayText || 'Please check the result panel.'}`
+                : aiResponse,
+                {
+                    language: detectedLang,
+                    onEnd: () => {
+                        setIsSpeakingAI(false);
+                        updateStatus('idle');
+                        if (hasFinalAssessment) setTimeout(() => setScreen('result'), 800);
+                    },
+                    onError: () => {
+                        setIsSpeakingAI(false);
+                        updateStatus('idle');
+                        if (hasFinalAssessment) setTimeout(() => setScreen('result'), 800);
+                    },
+                }
+            );
         } catch (err) {
             console.error('AI pipeline error:', err);
             addMessage('assistant', "I'm having trouble connecting right now. Please try again.", { isError: true });
-            setStatus('idle');
+            updateStatus('idle');
             setIsSpeakingAI(false);
         }
-    }, [screen, addMessage]);
+    }, [screen, addMessage, updateStatus]);
 
-    // ── Deepgram microphone control ─────────────────────────────────────────────
-    const startListening = useCallback(() => {
-        if (status !== 'idle') return;
-        setStatus('listening');
+    // ── Microphone control ──────────────────────────────────────────────────────
+    const startListening = useCallback(async () => {
+        if (statusRef.current !== 'idle') return;
+        updateStatus('listening');
         setInterimText('');
 
-        startDeepgramListening({
-            onReady: () => {
-                // WebSocket connected
-            },
-            onInterim: (text) => {
-                setInterimText(text);
-            },
+        const method = await startListeningService({
+            onInterim: (text) => setInterimText(text),
             onFinal: (text, deepgramLang) => {
                 setInterimText('');
-                stopDeepgramListening();
+                stopListeningService();
                 processUserInput(text, deepgramLang);
             },
             onError: (errMsg) => {
-                console.error('Deepgram error:', errMsg);
-                setStatus('idle');
+                console.error('Speech error:', errMsg);
+                updateStatus('idle');
                 setInterimText('');
+                // Show a brief notification in chat
+                addMessage('assistant', `⚠️ ${errMsg}`, { isError: true });
             },
             onClose: () => {
-                if (status === 'listening') {
-                    setStatus('idle');
+                if (statusRef.current === 'listening') {
+                    updateStatus('idle');
                     setInterimText('');
                 }
             },
         });
-    }, [status, processUserInput]);
+
+        setMicMethod(method);
+
+        // If startListeningService returned null, something went wrong
+        if (!method) {
+            updateStatus('idle');
+        }
+    }, [processUserInput, updateStatus, addMessage]);
 
     const stopListening = useCallback(() => {
-        stopDeepgramListening();
-        setStatus('idle');
+        stopListeningService();
+        updateStatus('idle');
         setInterimText('');
-    }, []);
+    }, [updateStatus]);
 
     const interruptAI = useCallback(() => {
         stopMurfSpeaking();
         setIsSpeakingAI(false);
-        setStatus('idle');
-    }, []);
+        updateStatus('idle');
+    }, [updateStatus]);
 
     const resetSession = useCallback(() => {
         stopMurfSpeaking();
-        stopDeepgramListening();
+        stopListeningService();
+        releaseMicrophone();
         setMessages([]);
-        setStatus('idle');
+        updateStatus('idle');
         setInterimText('');
         setLanguage('en');
         setIsEmergency(false);
@@ -179,29 +175,16 @@ export function SessionProvider({ children }) {
         setScreen('home');
         setIsSpeakingAI(false);
         setSymptoms([]);
+        setMicMethod(null);
         conversationHistoryRef.current = [];
-    }, []);
+    }, [updateStatus]);
 
     const value = {
-        messages,
-        status,
-        interimText,
-        language,
-        isEmergency,
-        assessment,
-        screen,
-        isSpeakingAI,
-        symptoms,
-        // Actions
-        setStatus,
-        setInterimText,
-        setScreen,
-        startListening,
-        stopListening,
-        processUserInput,
-        interruptAI,
-        resetSession,
-        addMessage,
+        messages, status, interimText, language, isEmergency,
+        assessment, screen, isSpeakingAI, symptoms, micMethod,
+        setStatus: updateStatus, setInterimText, setScreen,
+        startListening, stopListening, processUserInput,
+        interruptAI, resetSession, addMessage,
     };
 
     return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;

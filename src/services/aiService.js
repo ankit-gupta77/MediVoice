@@ -1,13 +1,11 @@
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
+const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || import.meta.env.VITE_GEMINI_API_KEY || ''; // Fallback just in case
 
-// Try models in order until one works
-const GEMINI_MODELS = [
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-latest',
-    'gemini-2.0-flash',
-    'gemini-pro',
+const GROQ_MODELS = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'mixtral-8x7b-32768'
 ];
-const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GROQ_BASE = 'https://api.groq.com/openai/v1/chat/completions';
 
 const SYSTEM_PROMPT = `You are MediVoice, a compassionate, calm, and highly intelligent AI health assistant. Your role is to:
 
@@ -41,68 +39,65 @@ For follow-up questions during conversation, respond naturally without the ASSES
 
 You have memory of the full conversation. Build on previous answers.`;
 
-export async function sendToGemini(conversationHistory, userMessage) {
-    if (!GEMINI_API_KEY) {
+export async function sendToGroq(conversationHistory, userMessage) {
+    if (!GROQ_API_KEY) {
         return getMockResponse(conversationHistory, userMessage);
     }
 
-    const messages = conversationHistory.map(msg => ({
-        role: msg.role === 'user' ? 'user' : 'model',
-        parts: [{ text: msg.content }],
-    }));
-
-    messages.push({
-        role: 'user',
-        parts: [{ text: userMessage }],
-    });
+    const messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...conversationHistory.map(msg => ({
+            role: msg.role === 'user' ? 'user' : 'assistant',
+            content: msg.content
+        })),
+        { role: 'user', content: userMessage }
+    ];
 
     const body = JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: messages,
-        generationConfig: { temperature: 0.7, maxOutputTokens: 500, topP: 0.95 },
+        model: GROQ_MODELS[0],
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 500,
+        top_p: 0.95,
     });
 
-    // Try each model in order until one succeeds
-    for (const model of GEMINI_MODELS) {
+    for (const model of GROQ_MODELS) {
         try {
-            const url = `${GEMINI_BASE}/${model}:generateContent?key=${GEMINI_API_KEY}`;
-            const response = await fetch(url, {
+            const requestBody = JSON.parse(body);
+            requestBody.model = model;
+
+            const response = await fetch(GROQ_BASE, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${GROQ_API_KEY}`
+                },
+                body: JSON.stringify(requestBody),
             });
 
             if (response.status === 429 || response.status === 403) {
-                // Quota exhausted or no access — try next model
-                console.warn(`Gemini ${model}: quota/access issue (${response.status}), trying next...`);
-                continue;
-            }
-
-            if (response.status === 404) {
-                // Model not found — try next
-                console.warn(`Gemini ${model}: not found, trying next...`);
+                console.warn(`Groq ${model}: quota/access issue (${response.status}), trying next...`);
                 continue;
             }
 
             if (!response.ok) {
                 const err = await response.text();
-                console.warn(`Gemini ${model} error: ${err}`);
+                console.warn(`Groq ${model} error: ${err}`);
                 continue;
             }
 
             const data = await response.json();
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            const text = data.choices?.[0]?.message?.content;
             if (text) {
-                console.info(`✅ Gemini responded via model: ${model}`);
+                console.info(`✅ Groq responded via model: ${model}`);
                 return text;
             }
         } catch (err) {
-            console.warn(`Gemini ${model} fetch error:`, err);
+            console.warn(`Groq ${model} fetch error:`, err);
         }
     }
 
-    // All models failed — fall back to demo mode gracefully
-    console.warn('All Gemini models failed; using demo mode');
+    console.warn('All Groq models failed; using demo mode');
     return getMockResponse(conversationHistory, userMessage);
 }
 
@@ -147,8 +142,12 @@ ASSESSMENT_END`;
 
 function getMockResponse(history, userMessage) {
     const turnCount = history.filter(m => m.role === 'user').length;
+    const isGreeting = /^(hi|hello|hey|namaste|greetings)[\s!.]*$/i.test(userMessage.trim());
 
     if (turnCount === 0) {
+        if (isGreeting) {
+            return "Hello! I am MediVoice. Tell me, how are you feeling today?";
+        }
         return `I'm sorry to hear you're not feeling well. ${detectOpeningSympathy(userMessage)} Could you tell me more — when did these symptoms first start?`;
     }
 

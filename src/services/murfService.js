@@ -8,23 +8,23 @@ const MURF_GEN_URL = 'https://api.murf.ai/v1/speech/generate';
 const MURF_STREAM_URL = 'https://api.murf.ai/v1/speech/stream';
 
 
-// Per-language voice configuration — Voice IDs from Murf Voice Library
-// https://murf.ai/api/docs/voices-styles/voice-library
+// Per-language voice configuration — GEN2 with fastest voices per locale
 const VOICE_MAP = {
     'en': {
-        voice_id: 'en-IN-ayush',     // Indian English male – warm, professional
-        locale: 'en-IN',
-        style: 'conversational',
+        voice_id: 'en-US-natalie',
+        modelVersion: 'GEN2',
+        style: 'Conversational',
+        multiNativeLocale: 'en-IN',
     },
     'hi': {
-        voice_id: 'hi-IN-riya',      // Hindi female – natural, calm
-        locale: 'hi-IN',
-        style: 'conversational',
+        voice_id: 'hi-IN-shweta',     // Native Hindi female — clear & natural
+        modelVersion: 'GEN2',
+        style: 'Conversational',
     },
     'hinglish': {
-        voice_id: 'en-IN-ayush',     // Indian English – best for code-switching
-        locale: 'en-IN',
-        style: 'conversational',
+        voice_id: 'hi-IN-shweta',     // Native Hindi voice handles Hinglish well
+        modelVersion: 'GEN2',
+        style: 'Conversational',
     },
 };
 
@@ -69,13 +69,13 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
             },
             body: JSON.stringify({
                 text: cleanText,
-                voice_id: voiceCfg.voice_id,
-                locale: voiceCfg.locale,
-                model: 'GEN2',               // Studio-quality voice
+                voiceId: voiceCfg.voice_id,
+                style: voiceCfg.style,
+                modelVersion: voiceCfg.modelVersion || 'GEN2',
+                multiNativeLocale: voiceCfg.multiNativeLocale || 'en-IN',
                 format: 'MP3',
-                sample_rate: 24000,
-                channel_type: 'MONO',
-                style: voiceCfg.style || 'conversational',
+                sampleRate: 24000,
+                channelType: 'MONO',
             }),
         });
 
@@ -85,14 +85,22 @@ export async function speakWithMurf(text, { language = 'en', onStart, onEnd, onE
         }
 
         const data = await response.json();
-        const audioUrl = data?.audio_file || data?.audioFile || data?.url;
 
-        if (!audioUrl) {
-            throw new Error('Murf returned no audio URL');
+        // Prefer encodedAudio (base64) for zero-latency playback.
+        // Avoids a 2nd round-trip to fetch the audioFile URL.
+        let audioSrc;
+        if (data?.encodedAudio) {
+            audioSrc = `data:audio/mp3;base64,${data.encodedAudio}`;
+        } else {
+            audioSrc = data?.audioFile || data?.audio_file || data?.url;
         }
 
-        // Play the returned audio URL
-        currentAudio = new Audio(audioUrl);
+        if (!audioSrc) {
+            throw new Error('Murf returned no audio');
+        }
+
+        // Play directly — base64 data URIs start instantly
+        currentAudio = new Audio(audioSrc);
         currentAudio.volume = 1.0;
 
         currentAudio.onplay = () => {

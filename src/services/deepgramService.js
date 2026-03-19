@@ -1,144 +1,230 @@
-// Deepgram Live Transcription Service
-// Uses WebSocket connection directly from the browser
+// Robust Speech Service
+// Priority: Deepgram WebSocket → Web Speech API fallback
+// Automatically switches to Web Speech API if Deepgram fails
 
 const DEEPGRAM_API_KEY = import.meta.env.VITE_DEEPGRAM_API_KEY;
 const DEEPGRAM_WS_URL = 'wss://api.deepgram.com/v1/listen';
 
-let socket = null;
-let mediaRecorder = null;
-let audioStream = null;
+// ── State ──────────────────────────────────────────────────────────────────
+let dgSocket = null;
+let dgMediaRecorder = null;
+let dgAudioStream = null;
+let wsListeners = null;
+let isIntentionalClose = false;
 
-/**
- * Start Deepgram live transcription
- * @param {Object} options
- * @param {Function} options.onInterim - Called with interim transcript text
- * @param {Function} options.onFinal - Called with final transcript text + detected language
- * @param {Function} options.onError - Called on error
- * @param {Function} options.onReady - Called when connection is established
- * @param {Function} options.onClose - Called when connection closes
- */
-export async function startDeepgramListening({ onInterim, onFinal, onError, onReady, onClose } = {}) {
-    try {
-        // Get microphone access
-        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+let webSpeechRec = null;
 
-        // Build WebSocket URL with params
+// ── Deepgram WebSocket STT ─────────────────────────────────────────────────
+async function startDeepgram({ onInterim, onFinal, onError, onClose }) {
+    if (!dgAudioStream || !dgAudioStream.active) {
+        try {
+            dgAudioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+            throw new Error('mic_denied');
+        }
+    }
+
+    isIntentionalClose = false;
+
+    return new Promise((resolve, reject) => {
         const params = new URLSearchParams({
-            model: 'nova-2',
-            language: 'multi',          // Multi-language detection (EN + HI)
-            detect_language: 'true',    // Auto-detect language
+            model: 'nova-3',
+            language: 'hi', // Fixed language; we detect later via heuristic
             interim_results: 'true',
             smart_format: 'true',
-            utterance_end_ms: '1200',
-            endpointing: '400',
+            endpointing: '500',
+            utterance_end_ms: '1500',
             punctuate: 'true',
         });
 
-        const url = `${DEEPGRAM_WS_URL}?${params.toString()}`;
+        const url = `${DEEPGRAM_WS_URL}?${params}`;
 
-        // Open WebSocket with API key in protocol header (browser-compatible method)
-        socket = new WebSocket(url, ['token', DEEPGRAM_API_KEY]);
-        socket.binaryType = 'arraybuffer';
+        try {
+            dgSocket = new WebSocket(url, ['token', DEEPGRAM_API_KEY]);
+            dgSocket.binaryType = 'arraybuffer';
+        } catch (e) {
+            reject(new Error('ws_init_failed'));
+            return;
+        }
 
-        socket.onopen = () => {
-            onReady?.();
+        // Timeout: if socket doesn't open in 4s, reject so we fall back
+        const openTimeout = setTimeout(() => {
+            dgSocket?.close();
+            reject(new Error('ws_timeout'));
+        }, 4000);
 
-            // Start MediaRecorder and send audio chunks
-            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus'
-                : 'audio/webm';
+        dgSocket.onopen = () => {
+            clearTimeout(openTimeout);
 
-            mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+            try {
+                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : MediaRecorder.isTypeSupported('audio/webm')
+                        ? 'audio/webm'
+                        : 'audio/ogg';
 
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
-                    socket.send(e.data);
-                }
-            };
-
-            mediaRecorder.start(250); // Send chunks every 250ms
+                dgMediaRecorder = new MediaRecorder(dgAudioStream, { mimeType });
+                dgMediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0 && dgSocket?.readyState === WebSocket.OPEN) {
+                        dgSocket.send(e.data);
+                    }
+                };
+                dgMediaRecorder.start(200);
+                resolve('deepgram');
+            } catch (err) {
+                console.error("MediaRecorder error:", err);
+                dgSocket?.close();
+                reject(new Error('media_recorder_failed'));
+            }
         };
 
-        socket.onmessage = (event) => {
+        dgSocket.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-
-                // Extract transcript
                 const transcript = data?.channel?.alternatives?.[0]?.transcript;
-                const isFinal = data?.is_final;
-                const speechFinal = data?.speech_final;
-                const detectedLang = data?.channel?.detected_language || 'en';
-
                 if (!transcript) return;
-
-                if (!isFinal) {
-                    // Interim result
+                if (!data.is_final) {
                     onInterim?.(transcript);
-                } else if (isFinal && transcript.trim()) {
-                    // Final result
-                    onFinal?.(transcript.trim(), detectedLang);
+                } else if (transcript.trim()) {
+                    onFinal?.(transcript.trim(), data?.channel?.detected_language || 'en');
                 }
-            } catch (err) {
-                console.warn('Deepgram parse error:', err);
+            } catch (_) { }
+        };
+
+        dgSocket.onerror = () => {
+            clearTimeout(openTimeout);
+            const wasIntentional = isIntentionalClose;
+            cleanupDG();
+            if (!wasIntentional) {
+                onError?.('Deepgram connection error');
             }
+            reject(new Error('ws_error'));
         };
 
-        socket.onerror = (err) => {
-            console.error('Deepgram WebSocket error:', err);
-            onError?.('Deepgram connection error. Please check your API key.');
-        };
-
-        socket.onclose = (event) => {
-            cleanupMediaRecorder();
+        dgSocket.onclose = (e) => {
+            cleanupDG();
             onClose?.();
-            if (event.code !== 1000 && event.code !== 1001) {
-                console.warn(`Deepgram closed unexpectedly: code=${event.code}`);
-            }
         };
+    });
+}
 
-    } catch (err) {
-        console.error('Deepgram start error:', err);
-        if (err.name === 'NotAllowedError') {
-            onError?.('Microphone permission denied. Please allow microphone access.');
-        } else {
-            onError?.(`Could not start microphone: ${err.message}`);
+function cleanupDG() {
+    isIntentionalClose = true;
+    if (dgMediaRecorder && dgMediaRecorder.state !== 'inactive') {
+        try { dgMediaRecorder.stop(); } catch (_) { }
+    }
+    dgMediaRecorder = null;
+    if (dgSocket) {
+        try { dgSocket.close(1000); } catch (_) { }
+        dgSocket = null;
+    }
+    // We intentionally DO NOT stop dgAudioStream here to allow reuse and prevent Chrome audio glitches.
+}
+
+export function releaseMicrophone() {
+    if (dgAudioStream) {
+        dgAudioStream.getTracks().forEach(t => t.stop());
+        dgAudioStream = null;
+    }
+}
+
+// ── Web Speech API fallback ────────────────────────────────────────────────
+function startWebSpeech({ onInterim, onFinal, onError, onClose }) {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+        onError?.('Speech recognition not supported. Please use Chrome.');
+        return false;
+    }
+
+    webSpeechRec = new SR();
+    webSpeechRec.continuous = false;
+    webSpeechRec.interimResults = true;
+    webSpeechRec.lang = 'hi-IN'; // Works for Hindi + English + Hinglish in Chrome
+    webSpeechRec.maxAlternatives = 1;
+
+    webSpeechRec.onresult = (event) => {
+        let interim = '';
+        let final = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            const t = event.results[i][0].transcript;
+            if (event.results[i].isFinal) final += t;
+            else interim += t;
         }
+        if (interim) onInterim?.(interim);
+        if (final.trim()) onFinal?.(final.trim(), null);
+    };
+
+    webSpeechRec.onend = () => { webSpeechRec = null; onClose?.(); };
+    webSpeechRec.onerror = (e) => {
+        webSpeechRec = null;
+        if (e.error === 'not-allowed') {
+            onError?.('Microphone permission denied. Please allow microphone access.');
+        } else if (e.error !== 'aborted') {
+            onClose?.();
+        }
+    };
+
+    try {
+        webSpeechRec.start();
+        return true;
+    } catch (e) {
+        webSpeechRec = null;
+        return false;
     }
 }
 
-export function stopDeepgramListening() {
-    // Send close message to Deepgram
-    if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'CloseStream' }));
-        socket.close(1000, 'User stopped');
-    }
-    socket = null;
-    cleanupMediaRecorder();
-}
-
-function cleanupMediaRecorder() {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-    }
-    mediaRecorder = null;
-    if (audioStream) {
-        audioStream.getTracks().forEach(t => t.stop());
-        audioStream = null;
-    }
-}
-
-export function isDeepgramConnected() {
-    return socket?.readyState === WebSocket.OPEN;
-}
+// ── Public API ─────────────────────────────────────────────────────────────
 
 /**
- * Map Deepgram-detected language code to our internal language key
+ * Start listening — tries Deepgram first, falls back to Web Speech API.
+ * Returns a promise that resolves with 'deepgram' | 'webspeech'
  */
+export async function startListeningService(callbacks) {
+    wsListeners = callbacks;
+    const { onError } = callbacks;
+
+    // Try Deepgram if API key is present
+    if (DEEPGRAM_API_KEY) {
+        try {
+            const method = await startDeepgram(callbacks);
+            console.info('🎤 Using Deepgram STT');
+            return method;
+        } catch (err) {
+            console.warn('Deepgram failed:', err.message, '— falling back to Web Speech API');
+            cleanupDG();
+        }
+    }
+
+    // Fallback: Web Speech API
+    const ok = startWebSpeech(callbacks);
+    if (ok) {
+        console.info('🎤 Using Web Speech API (fallback)');
+        return 'webspeech';
+    }
+
+    onError?.('Could not start microphone. Please use Chrome and allow mic access.');
+    return null;
+}
+
+export function stopListeningService() {
+    cleanupDG();
+    if (webSpeechRec) {
+        try { webSpeechRec.stop(); } catch (_) { }
+        webSpeechRec = null;
+    }
+}
+
+export function isListeningActive() {
+    return (
+        dgSocket?.readyState === WebSocket.OPEN ||
+        webSpeechRec != null
+    );
+}
+
+// ── Language util (re-exported) ────────────────────────────────────────────
 export function mapDeepgramLang(langCode) {
     if (!langCode) return 'en';
-    const lower = langCode.toLowerCase();
-    if (lower.startsWith('hi')) return 'hi';
-    if (lower.startsWith('en')) return 'en';
-    // Any other code defaults to English
+    const l = langCode.toLowerCase();
+    if (l.startsWith('hi')) return 'hi';
     return 'en';
 }

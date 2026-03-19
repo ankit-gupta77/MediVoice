@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { motion } from 'framer-motion';
 import { useSession } from '../context/SessionContext';
 import AnimatedOrb from '../components/AnimatedOrb';
@@ -16,6 +16,8 @@ export default function HomeScreen() {
         status, interimText,
         startListening, stopListening, processUserInput, isSpeakingAI, interruptAI,
     } = useSession();
+
+    const [textInput, setTextInput] = useState('');
 
     const isListening = status === 'listening';
 
@@ -103,14 +105,32 @@ export default function HomeScreen() {
                 </div>
 
                 {!isListening && !interimText && (
-                    <motion.p
-                        className="mt-6 text-white/30 text-sm text-center"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        transition={{ delay: 1 }}
+                    <form
+                        onSubmit={(e) => {
+                            e.preventDefault();
+                            if (textInput.trim() && status === 'idle') {
+                                processUserInput(textInput.trim(), null);
+                                setTextInput('');
+                            }
+                        }}
+                        className="w-full max-w-sm mt-6 flex gap-2"
                     >
-                        Tap the orb and tell me how you're feeling
-                    </motion.p>
+                        <input
+                            type="text"
+                            placeholder="Type your symptoms here..."
+                            value={textInput}
+                            onChange={(e) => setTextInput(e.target.value)}
+                            disabled={status !== 'idle'}
+                            className="flex-1 px-5 py-3 rounded-full bg-white/5 border border-white/10 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-sky-400/50 transition-colors disabled:opacity-50"
+                        />
+                        <button
+                            type="submit"
+                            disabled={!textInput.trim() || status !== 'idle'}
+                            className="w-11 h-11 flex-shrink-0 rounded-full bg-sky-500/20 flex items-center justify-center text-sky-300 border border-sky-400/30 hover:bg-sky-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                        >
+                            ➤
+                        </button>
+                    </form>
                 )}
 
                 {/* Quick-start chips */}

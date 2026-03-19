@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useSession } from '../context/SessionContext';
 import ChatBubble from '../components/ChatBubble';
@@ -12,6 +12,7 @@ export default function ChatScreen() {
         startListening, stopListening, interruptAI, resetSession, setScreen,
     } = useSession();
 
+    const [textInput, setTextInput] = useState('');
     const messagesEndRef = useRef(null);
     const isListening = status === 'listening';
 
@@ -128,6 +129,36 @@ export default function ChatScreen() {
             {/* Bottom bar */}
             <div className="sticky bottom-0 z-20 px-5 py-4"
                 style={{ backdropFilter: 'blur(20px)', background: 'rgba(3,7,18,0.7)', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                
+                {/* Text input row */}
+                <form
+                    onSubmit={(e) => {
+                        e.preventDefault();
+                        if (textInput.trim() && status === 'idle') {
+                            processUserInput(textInput.trim(), null);
+                            setTextInput('');
+                        }
+                    }}
+                    className="flex w-full items-center gap-2 mb-4"
+                >
+                    <input
+                        type="text"
+                        placeholder="Type your reply..."
+                        value={textInput}
+                        onChange={(e) => setTextInput(e.target.value)}
+                        disabled={status !== 'idle'}
+                        className="flex-1 px-4 py-2.5 rounded-full bg-white/5 border border-white/10 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-sky-400/50 transition-colors disabled:opacity-50"
+                    />
+                    <button
+                        type="submit"
+                        disabled={!textInput.trim() || status !== 'idle'}
+                        className="w-10 h-10 flex-shrink-0 rounded-full bg-sky-500/20 flex items-center justify-center text-sky-300 border border-sky-400/30 hover:bg-sky-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                    >
+                        ➤
+                    </button>
+                </form>
+
+                {/* Action buttons row */}
                 <div className="flex items-center justify-center gap-4">
                     {isSpeakingAI && (
                         <motion.button onClick={interruptAI}
@@ -137,7 +168,7 @@ export default function ChatScreen() {
                         </motion.button>
                     )}
 
-                    <AnimatedOrb size={72} onClick={handleOrbClick} />
+                    <AnimatedOrb size={64} onClick={handleOrbClick} />
 
                     <motion.button onClick={() => setScreen('result')}
                         className="px-4 py-2 rounded-2xl text-xs font-medium text-white/40 glass border border-white/10 hover:border-purple-400/30 hover:text-purple-300 transition-all"
@@ -145,12 +176,6 @@ export default function ChatScreen() {
                         📊 Results
                     </motion.button>
                 </div>
-
-                <p className="text-center text-xs text-white/20 mt-2">
-                    {isListening ? '🔴 Listening (Deepgram) — tap to stop'
-                        : isSpeakingAI ? '🔊 Speaking (Murf AI) — tap to interrupt'
-                            : 'Tap mic to speak'}
-                </p>
             </div>
         </div>
     );

@@ -33,7 +33,7 @@ export function detectLanguage(text) {
             'mein', 'aur', 'nahi', 'hua', 'kar', 'pe', 'se', 'ko', 'ka', 'ki',
             'sar', 'dard', 'bukhar', 'pet', 'khana', 'pani', 'neend', 'thakan'];
         const lowerText = text.toLowerCase();
-        const hasHinglish = hinglishWords.some(w => lowerText.includes(w));
+        const hasHinglish = hinglishWords.some(w => new RegExp(`\\b${w}\\b`).test(lowerText));
         return hasHinglish ? 'hinglish' : 'en';
     }
 
